@@ -1,0 +1,21 @@
+name: relay
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+concurrency:
+  group: relay
+  cancel-in-progress: false
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+      - name: Telegram <-> hub
+        run: python3 relay.py
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          HUB_URL: ${{ secrets.HUB_URL }}
+          RELAY_KEY: ${{ secrets.RELAY_KEY }}
+          WINDOW: '50'
