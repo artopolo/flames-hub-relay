@@ -123,4 +123,12 @@ def files_of_needed(u):
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except SystemExit as e:
+        if e.code not in (None, 0):
+            print('::error::%s' % e.code)
+        raise
+    except Exception as e:
+        print('::error::%s: %s' % (type(e).__name__, e))
+        raise
