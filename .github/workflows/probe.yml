@@ -1,0 +1,13 @@
+name: probe
+on: workflow_dispatch
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - run: |
+          for u in https://functions.yandexcloud.net/d4e6cg7g7htorga9uq58 https://storage.yandexcloud.net https://ya.ru https://lab.flames.spa https://api.telegram.org; do
+            r=$(curl -sS -o /dev/null -w "%{http_code} c=%{time_connect} t=%{time_total} ip=%{remote_ip}" -m 20 "$u" 2>&1 | tr '\n' ' ')
+            echo "::notice::$u -> $r"
+          done
+          echo "::notice::runner ip $(curl -s -m 10 https://api.ipify.org)"
