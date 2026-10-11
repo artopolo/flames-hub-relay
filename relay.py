@@ -21,6 +21,8 @@ def post(url, data, timeout=60, ctype='application/json'):
             return json.loads(e.read())
         except Exception:
             return {'ok': False, 'description': 'http %s' % e.code}
+    except (urllib.error.URLError, TimeoutError) as e:
+        raise RuntimeError('%s: %s' % ('hub' if url.startswith(HUB) else 'tg ' + url.rsplit('/', 1)[-1], e)) from e
 
 
 def tg(method, _t=40, **p):
