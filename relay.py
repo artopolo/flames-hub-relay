@@ -131,6 +131,13 @@ if __name__ == '__main__':
         if e.code not in (None, 0):
             print('::error::%s' % e.code)
         raise
+    except RuntimeError as e:
+        if str(e).startswith('hub:'):
+            # hub unreachable (Yandex Cloud side): Telegram keeps unconfirmed updates ~24h, next run retries
+            print('::warning::hub unreachable, skipped run: %s' % e)
+            sys.exit(0)
+        print('::error::%s: %s' % (type(e).__name__, e))
+        raise
     except Exception as e:
         print('::error::%s: %s' % (type(e).__name__, e))
         raise
