@@ -1,21 +1,25 @@
 name: relay
 on:
+  workflow_dispatch:          # the hub wakes the relay when it has something to send or a file to fetch
   schedule:
-    - cron: '*/5 * * * *'
-  workflow_dispatch:
+    - cron: '*/5 * * * *'     # fallback only; GitHub runs it every few hours at best
 concurrency:
   group: relay
   cancel-in-progress: false
 jobs:
   relay:
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Telegram <-> hub
         run: python3 relay.py
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
-          HUB_URL: ${{ secrets.HUB_URL }}
           RELAY_KEY: ${{ secrets.RELAY_KEY }}
+          HUB_URL: ${{ secrets.HUB_URL }}
+          HUB_URLS: ''        # API Gateway address goes here, tried before HUB_URL
+          HOOK_URL: ''        # address Telegram posts updates to; empty = first hub address
           WINDOW: '50'
+          BUSY: '150'
+          IDLE: '25'

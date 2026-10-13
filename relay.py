@@ -1,14 +1,29 @@
 #!/usr/bin/env python3
-"""Telegram <-> Flames hub relay. Runs in GitHub Actions on a schedule (Yandex Cloud can't reach Telegram).
-Each run: poll Telegram for WINDOW seconds, hand updates (+ small files) to the hub, execute the hub's queued
-Telegram calls, report sent message ids back. Updates are confirmed only after the hub accepted them."""
+"""Telegram <-> Flames hub relay (GitHub Actions). Yandex Cloud can't call Telegram, so every Telegram call is made here.
+
+The hub wakes this workflow on demand (workflow_dispatch) when it has something to send or a file to fetch;
+a schedule is only a fallback.
+- Webhook mode: Telegram posts updates straight into the hub (text is handled there at once). This run downloads
+  files the hub is waiting for and sends the messages it queued, then exits after a short idle period.
+- Poll mode (webhook not wanted or not reachable): long-poll getUpdates for WINDOW seconds, as before.
+Updates are confirmed only after the hub accepted them."""
 import base64, json, os, sys, time, urllib.request, urllib.error
 
-TOKEN, HUB, KEY = os.environ['TG_TOKEN'].strip(), os.environ['HUB_URL'].strip(), os.environ['RELAY_KEY'].strip()
-WINDOW = int(os.environ.get('WINDOW', '50'))
+TOKEN, KEY = os.environ['TG_TOKEN'].strip(), os.environ['RELAY_KEY'].strip()
+HUBS = []
+for u in (os.environ.get('HUB_URLS') or '').split(',') + [os.environ.get('HUB_URL') or '']:
+    if u.strip() and u.strip() not in HUBS:
+        HUBS.append(u.strip())
+HOOK = (os.environ.get('HOOK_URL') or '').strip() or HUBS[0]  # address Telegram posts to
+WINDOW = int(os.environ.get('WINDOW', '50'))  # poll mode: seconds of long-polling
+BUSY = int(os.environ.get('BUSY', '150'))  # webhook mode: longest run
+IDLE = int(os.environ.get('IDLE', '25'))  # webhook mode: stop after this long with nothing to do
+STEP = float(os.environ.get('STEP', '3'))
+CHECK = float(os.environ.get('CHECK', '20'))  # webhook mode: how often to ask Telegram whether delivery works
 BASE = os.environ.get('TG_BASE', 'https://api.telegram.org')
 TG = BASE + '/bot%s/' % TOKEN
 MAXF = 2_300_000  # hub request body limit ~3.5 MB after base64
+ALLOWED = ['message', 'callback_query']
 
 
 def post(url, data, timeout=60, ctype='application/json'):
@@ -21,8 +36,8 @@ def post(url, data, timeout=60, ctype='application/json'):
             return json.loads(e.read())
         except Exception:
             return {'ok': False, 'description': 'http %s' % e.code}
-    except (urllib.error.URLError, TimeoutError) as e:
-        raise RuntimeError('%s: %s' % ('hub' if url.startswith(HUB) else 'tg ' + url.rsplit('/', 1)[-1], e)) from e
+    except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+        raise RuntimeError('%s: %s' % ('hub' if url.startswith(tuple(HUBS)) else 'tg ' + url.rsplit('/', 1)[-1], e)) from e
 
 
 def tg(method, _t=40, **p):
@@ -30,10 +45,21 @@ def tg(method, _t=40, **p):
 
 
 def hub(body):
-    r = post(HUB + '?relay=' + KEY, body, 90, 'text/plain')
-    if not r.get('ok'):
-        sys.exit('hub refused: %s' % str(r)[:300])
-    return r
+    """Call the hub; try each address (API Gateway first), stick to the one that answered."""
+    err = None
+    for i, u in enumerate(list(HUBS)):
+        try:
+            r = post(u + ('&' if '?' in u else '?') + 'relay=' + KEY, body, 90, 'text/plain')
+        except RuntimeError as e:
+            err = e
+            print('::warning::%s' % e)
+            continue
+        if i:
+            HUBS.insert(0, HUBS.pop(i))
+        if not r.get('ok'):
+            sys.exit('hub refused: %s' % str(r)[:300])
+        return r
+    raise RuntimeError('hub: %s' % err)
 
 
 def files_of(u):
@@ -58,6 +84,11 @@ def files_of(u):
                            'mime': f.get('mime_type')}}
 
 
+def needs_file(u):
+    m = u.get('message') or {}
+    return any(m.get(k) for k in ('photo', 'video', 'document', 'voice', 'audio', 'animation'))
+
+
 def run_out(out, sent):
     for e in out:
         r = tg(e['m'], **e['p'])
@@ -67,25 +98,46 @@ def run_out(out, sent):
             print('tg', e['m'], r.get('description'))
 
 
-def main():
-    me = tg('getMe')
-    if not me.get('ok'):
-        sys.exit('bad bot token: %s' % me.get('description'))
-    bot = me['result'].get('username')
-    tg('deleteWebhook')
-    tg('setMyCommands', commands=[{'command': 'p', 'description': 'выбрать страницу'},
-                                  {'command': 'now', 'description': 'куда пишу сейчас'}])
-    end, offset, sent, n = time.time() + WINDOW, None, {}, 0
-    first = True
+def deliver(updates, sent, extra=None):
+    """Hand updates (one per call when it carries a file) to the hub, run what it answers. Returns hub answer."""
+    files = {}
+    for u in updates:
+        try:
+            files.update(files_of(u))
+        except Exception as e:
+            print('file', e)
+    r = hub(dict(extra or {}, updates=updates, files=files, sent=dict(sent), bot=BOT))
+    sent.clear()
+    run_out(r.get('out') or [], sent)
+    return r
+
+
+def take_needed(r, sent):
+    """The hub lists webhook updates still waiting for their files; fetch and hand them over one by one."""
+    n = 0
+    for u in r.get('need') or []:
+        deliver([u], sent)
+        n += 1
+    return n
+
+
+def hook_broken(info):
+    le = info.get('last_error_date') or 0
+    return bool(le) and time.time() - le < 1800 and (info.get('pending_update_count') or 0) > 0
+
+
+def poll(sent, seconds):
+    end, offset, n = time.time() + seconds, None, 0
     while True:
         left = int(end - time.time())
-        ups = tg('getUpdates', 70, **{'offset': offset, 'timeout': max(0, min(25, left)),
-                                      'allowed_updates': ['message', 'callback_query']})
+        ups = tg('getUpdates', 70, **{'offset': offset, 'timeout': max(0, min(25, left)), 'allowed_updates': ALLOWED})
+        if not ups.get('ok'):
+            print('getUpdates', ups.get('description'))
+            break
         ups = ups.get('result') or []
-        # one update per hub call when it carries a file (body size), otherwise batch
         batches, cur = [], []
         for u in ups:
-            if files_of_needed(u):
+            if needs_file(u):
                 if cur:
                     batches.append(cur)
                     cur = []
@@ -95,33 +147,95 @@ def main():
         if cur or not batches:
             batches.append(cur)
         for bt in batches:
-            if not bt and not first and not sent:
-                continue
-            files = {}
-            for u in bt:
-                try:
-                    files.update(files_of(u))
-                except Exception as e:
-                    print('file', e)
-            r = hub({'updates': bt, 'files': files, 'sent': sent, 'bot': bot})
-            sent = {}
-            first = False
-            run_out(r.get('out') or [], sent)
-            n += len(bt)
+            r = deliver(bt, sent, {'pull': True, 'mode': 'poll'})
+            n += len(bt) + take_needed(r, sent)
             if bt:
                 offset = bt[-1]['update_id'] + 1
         if offset:
             tg('getUpdates', offset=offset, timeout=0)  # confirm
         if time.time() >= end - 1:
             break
-    if sent:
-        run_out(hub({'updates': [], 'sent': sent, 'bot': bot}).get('out') or [], {})
-    print('updates', n)
+    return n
 
 
-def files_of_needed(u):
-    m = u.get('message') or {}
-    return any(m.get(k) for k in ('photo', 'video', 'document', 'voice', 'audio', 'animation'))
+def webhook_loop(sent):
+    """Returns 'idle' when done, or 'broken' when Telegram can't reach the hub."""
+    start = last = time.time()
+    checked = start
+    while time.time() - start < BUSY:
+        r = hub({'pull': True, 'sent': dict(sent), 'bot': BOT, 'mode': 'webhook'})
+        sent.clear()
+        got = len(r.get('out') or []) + len(r.get('need') or [])
+        run_out(r.get('out') or [], sent)
+        take_needed(r, sent)
+        if got:
+            last = time.time()
+        if time.time() - checked > CHECK:
+            checked = time.time()
+            info = tg('getWebhookInfo').get('result') or {}
+            if hook_broken(info):
+                return 'broken: %s' % info.get('last_error_message')
+        if time.time() - last > IDLE:
+            return 'idle'
+        time.sleep(STEP)
+    return 'idle'
+
+
+BOT = None
+
+
+def main():
+    global BOT
+    me = tg('getMe')
+    if not me.get('ok'):
+        sys.exit('bad bot token: %s' % me.get('description'))
+    BOT = me['result'].get('username')
+    tg('setMyCommands', commands=[{'command': 'p', 'description': 'куда писать'},
+                                  {'command': 'now', 'description': 'куда пишу сейчас'},
+                                  {'command': 'new', 'description': 'новая папка: /new Название'}])
+    sent = {}
+    h = hub({'hello': True, 'pull': True, 'bot': BOT})
+    run_out(h.get('out') or [], sent)
+    take_needed(h, sent)
+    wh = h.get('wh') or {}
+    info = tg('getWebhookInfo').get('result') or {}
+    mode = 'poll'
+    if wh.get('want') and wh.get('secret'):
+        url = HOOK + ('&' if '?' in HOOK else '?') + 'tg=' + wh['secret']
+        if info.get('url') != url:
+            r = tg('setWebhook', url=url, secret_token=wh['secret'], max_connections=4, allowed_updates=ALLOWED)
+            if not r.get('ok'):
+                print('::warning::setWebhook: %s' % r.get('description'))
+                hub({'wh_fail': 'setWebhook: %s' % r.get('description')})
+            info = tg('getWebhookInfo').get('result') or {}
+        if info.get('url') == url and not hook_broken(info):
+            mode = 'webhook'
+        elif info.get('url'):
+            print('::warning::webhook unreachable: %s' % info.get('last_error_message'))
+            tg('deleteWebhook')  # pending updates stay with Telegram for getUpdates
+            hub({'wh_fail': info.get('last_error_message') or 'нет доставки'})
+    elif info.get('url'):
+        tg('deleteWebhook')
+    print('mode', mode)
+    if mode == 'webhook':
+        res = webhook_loop(sent)
+        print('webhook', res)
+        if res.startswith('broken'):
+            print('::warning::webhook unreachable: %s' % res)
+            tg('deleteWebhook')
+            hub({'wh_fail': res[8:] or 'нет доставки'})
+            mode = 'poll'
+        else:
+            hub({'wh_ok': True})
+    if mode == 'poll':
+        print('updates', poll(sent, WINDOW))
+    for _ in range(5):  # say goodbye; hand over anything that arrived meanwhile
+        r = hub({'bye': True, 'pull': True, 'sent': dict(sent), 'bot': BOT})
+        sent.clear()
+        run_out(r.get('out') or [], sent)
+        if not r.get('need') and not sent:
+            break
+        take_needed(r, sent)
 
 
 if __name__ == '__main__':
