@@ -22,7 +22,8 @@ STEP = float(os.environ.get('STEP', '3'))
 CHECK = float(os.environ.get('CHECK', '20'))  # webhook mode: how often to ask Telegram whether delivery works
 BASE = os.environ.get('TG_BASE', 'https://api.telegram.org')
 TG = BASE + '/bot%s/' % TOKEN
-MAXF = 2_300_000  # hub request body limit ~3.5 MB after base64
+MAXF = 2_300_000  # hub request body limit ~3.5 MB after base64: bigger files go to the hub in chunks (up_*)
+TGMAX = 20_000_000  # Bot API getFile limit
 ALLOWED = ['message', 'callback_query']
 
 
@@ -72,16 +73,40 @@ def files_of(u):
             if m.get(k):
                 f = m[k]
                 break
-    if not f or (f.get('file_size') or 0) > MAXF:
+    if not f or (f.get('file_size') or 0) > TGMAX:
         return {}
     r = tg('getFile', file_id=f['file_id'])
     if not r.get('ok'):
         return {}
     path = r['result']['file_path']
-    with urllib.request.urlopen(BASE + '/file/bot%s/%s' % (TOKEN, path), timeout=60) as resp:
+    with urllib.request.urlopen(BASE + '/file/bot%s/%s' % (TOKEN, path), timeout=120) as resp:
         data = resp.read()
-    return {f['file_id']: {'data': base64.b64encode(data).decode(), 'name': f.get('file_name') or path.rsplit('/', 1)[-1],
-                           'mime': f.get('mime_type')}}
+    name = f.get('file_name') or path.rsplit('/', 1)[-1]
+    if len(data) > MAXF:
+        url = up_big(data, name, f.get('mime_type') or '')
+        return {f['file_id']: {'url': url, 'name': name, 'mime': f.get('mime_type'), 'size': len(data)}} if url else {}
+    return {f['file_id']: {'data': base64.b64encode(data).decode(), 'name': name, 'mime': f.get('mime_type')}}
+
+
+def up_big(data, name, mime):
+    """File bigger than one hub request: upload it in chunks (hub 1.7+). None if the hub can't take it."""
+    def q(step, **kw):
+        r = post(HUBS[0] + ('&' if '?' in HUBS[0] else '?') + 'relay=' + KEY, {'up': dict(kw, step=step)}, 120, 'text/plain')
+        if not r.get('ok'):
+            raise RuntimeError('up %s: %s' % (step, str(r)[:200]))
+        return r
+    try:
+        r = q('begin', name=name, size=len(data), mime=mime)
+        ch, per = int(r['chunk']), int(r['per'])
+        chunks = [data[i:i + ch] for i in range(0, len(data), ch)]
+        parts = [chunks[i:i + per] for i in range(0, len(chunks), per)]
+        for p, cs in enumerate(parts, 1):
+            for c, blob in enumerate(cs):
+                q('part', id=r['id'], p=p, c=c, data=base64.b64encode(blob).decode(), last=c == len(cs) - 1)
+        return q('end', id=r['id'], n=len(parts))['media']['u']
+    except Exception as e:
+        print('::warning::big file %s: %s' % (name, e))
+        return None
 
 
 def needs_file(u):
@@ -190,9 +215,6 @@ def main():
     if not me.get('ok'):
         sys.exit('bad bot token: %s' % me.get('description'))
     BOT = me['result'].get('username')
-    tg('setMyCommands', commands=[{'command': 'p', 'description': 'куда писать'},
-                                  {'command': 'now', 'description': 'куда пишу сейчас'},
-                                  {'command': 'new', 'description': 'новая папка: /new Название'}])
     sent = {}
     h = hub({'hello': True, 'pull': True, 'bot': BOT})
     run_out(h.get('out') or [], sent)
