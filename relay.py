@@ -45,6 +45,25 @@ def tg(method, _t=40, **p):
     return post(TG + method, p, _t)
 
 
+def tg_upload(method, field, url, **p):
+    """Методы, которые принимают только загрузку файла (setChatPhoto): качаем по ссылке и шлём multipart."""
+    with urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent': 'flames-relay'}), timeout=30) as r:
+        data = r.read()
+    b = 'flames' + os.urandom(8).hex()
+    body = b''.join(('--%s\r\nContent-Disposition: form-data; name="%s"\r\n\r\n%s\r\n' % (b, k, v)).encode() for k, v in p.items())
+    body += ('--%s\r\nContent-Disposition: form-data; name="%s"; filename="cover.jpg"\r\nContent-Type: image/jpeg\r\n\r\n' % (b, field)).encode() + data
+    body += ('\r\n--%s--\r\n' % b).encode()
+    req = urllib.request.Request(TG + method, data=body, headers={'Content-Type': 'multipart/form-data; boundary=' + b})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.loads(resp.read() or b'{}')
+    except urllib.error.HTTPError as e:
+        try:
+            return json.loads(e.read())
+        except Exception:
+            return {'ok': False, 'description': 'http %s' % e.code}
+
+
 def hub(body):
     """Call the hub; try each address (API Gateway first), stick to the one that answered."""
     err = None
@@ -116,7 +135,14 @@ def needs_file(u):
 
 def run_out(out, sent):
     for e in out:
-        r = tg(e['m'], **e['p'])
+        if e['m'] == 'setChatPhoto' and 'photo_url' in e['p']:
+            p = dict(e['p'])
+            try:
+                r = tg_upload('setChatPhoto', 'photo', p.pop('photo_url'), **p)
+            except Exception as x:
+                r = {'ok': False, 'description': 'картинка: %s' % x}
+        else:
+            r = tg(e['m'], **e['p'])
         if r.get('ok') and e.get('ref') and isinstance(r.get('result'), dict) and r['result'].get('message_id'):
             sent[str(r['result']['message_id'])] = e['ref']
         elif not r.get('ok') and e['m'] != 'answerCallbackQuery':
